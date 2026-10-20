@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"net"
 	"regexp"
 	"testing"
@@ -540,10 +541,23 @@ var _ = ginkgo.Describe("TXT records", func() {
 
 })
 
+type lookupIPAddrResolver struct {
+	upstreamResolver
+	ips   []net.IPAddr
+	err   error
+	calls int
+}
+
+func (r *lookupIPAddrResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	r.calls++
+	return r.ips, r.err
+}
+
 var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 	var (
-		mockSrv *mockdns.Server
-		server  *Server
+		mockSrv        *mockdns.Server
+		server         *Server
+		lookupResolver *lookupIPAddrResolver
 	)
 
 	const (
@@ -565,9 +579,8 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 		}, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-		// upstream backs the LookupTXT (and other typed-resolver) code paths;
-		// nameservers below backs the raw-forward code path used for
-		// SOA/PTR/AAAA/CAA/...
+		// upstream backs typed-resolver code paths; nameservers below back
+		// raw-forward queries such as SOA, PTR, and CAA.
 		upstream := &mockdns.Resolver{
 			Zones: map[string]mockdns.Zone{
 				aaaaDomain: {
@@ -575,7 +588,11 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 				},
 			},
 		}
-		server, err = NewWithUpstreamResolver(nil, nil, []types.Zone{}, upstream)
+		lookupResolver = &lookupIPAddrResolver{
+			upstreamResolver: upstream,
+			ips:              []net.IPAddr{{IP: net.ParseIP("fe80::1")}},
+		}
+		server, err = NewWithUpstreamResolver(nil, nil, []types.Zone{}, lookupResolver)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		// Point the raw forwarder at the mock upstream server.
 		server.handler.nameservers = []string{mockSrv.LocalAddr().String()}
@@ -602,13 +619,72 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 		gomega.Expect(ok).To(gomega.BeTrue(), "expected an SOA answer")
 	})
 
-	ginkgo.It("should forward AAAA queries", func() {
+	ginkgo.It("should resolve AAAA queries through the typed resolver", func() {
+		server.handler.client = &dns.Client{Timeout: 200 * time.Millisecond}
+		server.handler.nameservers = []string{"127.0.0.1:1"}
+
 		m := query(aaaaDomain, dns.TypeAAAA)
 		gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeSuccess))
 		gomega.Expect(m.Answer).To(gomega.HaveLen(1))
 		aaaa, ok := m.Answer[0].(*dns.AAAA)
 		gomega.Expect(ok).To(gomega.BeTrue(), "expected an AAAA answer")
 		gomega.Expect(aaaa.AAAA.String()).To(gomega.Equal("fe80::1"))
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("should include only valid IPv6 addresses in AAAA answers", func() {
+		lookupResolver.ips = []net.IPAddr{
+			{IP: net.ParseIP("192.0.2.1")},
+			{IP: net.ParseIP("::ffff:192.0.2.2")},
+			{IP: net.ParseIP("2001:db8::1")},
+			{IP: net.IP{1, 2}},
+		}
+		server.handler.nameservers = []string{"127.0.0.1:1"}
+
+		m := query(aaaaDomain, dns.TypeAAAA)
+		gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeSuccess))
+		gomega.Expect(m.Answer).To(gomega.HaveLen(1))
+		aaaa, ok := m.Answer[0].(*dns.AAAA)
+		gomega.Expect(ok).To(gomega.BeTrue(), "expected an AAAA answer")
+		gomega.Expect(aaaa.AAAA.String()).To(gomega.Equal("2001:db8::1"))
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("should return empty NOERROR for IPv4-only or empty AAAA lookups", func() {
+		for _, ips := range [][]net.IPAddr{
+			{{IP: net.ParseIP("192.0.2.1")}},
+			{},
+		} {
+			lookupResolver.ips = ips
+			m := query(aaaaDomain, dns.TypeAAAA)
+			gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeSuccess))
+			gomega.Expect(m.Answer).To(gomega.BeEmpty())
+		}
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(2))
+	})
+
+	ginkgo.It("should preserve lookup-error rcode for AAAA", func() {
+		lookupResolver.err = errors.New("lookup failed")
+		server.handler.nameservers = []string{"127.0.0.1:1"}
+
+		m := query(aaaaDomain, dns.TypeAAAA)
+		gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeNameError))
+		gomega.Expect(m.Answer).To(gomega.BeEmpty())
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("should leave A queries on the existing typed resolver behavior", func() {
+		lookupResolver.ips = []net.IPAddr{
+			{IP: net.ParseIP("192.0.2.1")},
+			{IP: net.ParseIP("::ffff:192.0.2.2")},
+			{IP: net.ParseIP("2001:db8::1")},
+		}
+		m := query(aaaaDomain, dns.TypeA)
+		gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeSuccess))
+		gomega.Expect(m.Answer).To(gomega.HaveLen(2))
+		gomega.Expect(m.Answer[0].(*dns.A).A.String()).To(gomega.Equal("192.0.2.1"))
+		gomega.Expect(m.Answer[1].(*dns.A).A.String()).To(gomega.Equal("192.0.2.2"))
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(1))
 	})
 
 	ginkgo.It("should forward PTR queries", func() {
@@ -621,17 +697,14 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 	})
 
 	ginkgo.It("should not forward queries for names owned by a local zone", func() {
-		// aaaaDomain falls under this zone's suffix. addLocalAnswers only
-		// special-cases dns.TypeA, so any other query type for a zone-owned
-		// name currently falls through to either the default case (SOA, and
-		// AAAA below) or an existing typed case (TXT), and gets forwarded to
-		// the real upstream instead of being answered (or left empty)
-		// locally -- leaking the internal name and returning whatever
-		// unrelated record the upstream happens to have.
 		zoneIP := net.ParseIP("192.168.127.5")
 		err := server.addZone(types.Zone{
 			Name:      "example.org.",
-			DefaultIP: zoneIP,
+			DefaultIP: net.ParseIP("192.168.127.6"),
+			Records: []types.Record{{
+				Name: "aaaa",
+				IP:   zoneIP,
+			}},
 		})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
@@ -643,13 +716,34 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
 		gomega.Expect(ok).To(gomega.BeTrue(), "expected an A answer")
 		gomega.Expect(aRecord.A.Equal(zoneIP)).To(gomega.BeTrue())
 
-		aaaa := query(aaaaDomain, dns.TypeAAAA)
-		gomega.Expect(aaaa.Answer).To(gomega.BeEmpty(), "AAAA query for a name owned by a local zone must not be forwarded to the real upstream nameservers")
+		server.handler.client = &dns.Client{Timeout: 200 * time.Millisecond}
+		server.handler.nameservers = []string{"127.0.0.1:1"}
+		callsBeforeLocalQueries := lookupResolver.calls
+		for _, name := range []string{aaaaDomain, "default.example.org."} {
+			m := query(name, dns.TypeAAAA)
+			gomega.Expect(m.Rcode).To(gomega.Equal(dns.RcodeSuccess))
+			gomega.Expect(m.Answer).To(gomega.BeEmpty(), "AAAA query for a name owned by a local zone must return local NODATA")
+		}
+
+		err = server.addZone(types.Zone{
+			Name: "internal.",
+			Records: []types.Record{{
+				Name: "owned",
+				IP:   zoneIP,
+			}},
+		})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		missing := query("missing.internal.", dns.TypeAAAA)
+		gomega.Expect(missing.Rcode).To(gomega.Equal(dns.RcodeNameError))
+		gomega.Expect(missing.Answer).To(gomega.BeEmpty())
+		gomega.Expect(lookupResolver.calls).To(gomega.Equal(callsBeforeLocalQueries))
 
 		soa := query(aaaaDomain, dns.TypeSOA)
+		gomega.Expect(soa.Rcode).To(gomega.Equal(dns.RcodeSuccess))
 		gomega.Expect(soa.Answer).To(gomega.BeEmpty(), "SOA query for a name owned by a local zone must not be forwarded to the real upstream nameservers")
 
 		txt := query(aaaaDomain, dns.TypeTXT)
+		gomega.Expect(txt.Rcode).To(gomega.Equal(dns.RcodeSuccess))
 		gomega.Expect(txt.Answer).To(gomega.BeEmpty(), "TXT query for a name owned by a local zone must not be forwarded to the real upstream resolver")
 	})
 
